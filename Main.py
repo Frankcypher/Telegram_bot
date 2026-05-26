@@ -1,9 +1,22 @@
-import time, requests, os
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google.oauth2.credentials import Credentials
+import os
+import time
+import requests
+import threading
+from flask import Flask
 
-# Load from Render Environment Variables
+# 1. Flask keep-alive for Render free tier
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot running"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
+
+threading.Thread(target=run_flask, daemon=True).start()
+
+# 2. Load from Render Environment Variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -15,13 +28,31 @@ TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 def send_tg(msg):
     try:
-        r = requests.post(f"{TG_API}/sendMessage",
-                         json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                         timeout=10)
+        r = requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10
+        )
         print("Telegram:", r.status_code, r.text)
         return r.status_code == 200
     except Exception as e:
         print("Telegram send failed:", e)
+        return False
+
+def send_video_tg(filepath, caption=""):
+    try:
+        with open(filepath, 'rb') as f:
+            r = requests.post(
+                f"{TG_API}/sendVideo",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"video": f},
+                timeout=120
+            )
+        print("Telegram video:", r.status_code)
+        return r.status_code == 200
+    except Exception as e:
+        print("Telegram video send failed:", e)
+        send_tg(f"❌ Failed to send video: {e}")
         return False
 
 def generate_story():
@@ -56,7 +87,8 @@ def generate_story():
         send_tg(f"❌ Parse error. Model output:\n{text}")
         return None, None
 
-    open("story.txt", "w", encoding="utf-8").write(story)
+    with open("story.txt", "w", encoding="utf-8") as f:
+        f.write(story)
     return story, video_prompt
 
 def generate_video(prompt):
@@ -85,22 +117,45 @@ def generate_video(prompt):
     try:
         with open("frame.png", "rb") as f:
             files = {"image": f}
-            data = {"motion_bucket_id": 127, "fps": 6}
-            r = requests.post(vid_url, headers=HEADERS, files=files, data=data, timeout=300)
-        r.raise_for_status()
+            vid = requests.post(vid_url, headers=HEADERS, files=files, timeout=180)
+            vid.raise_for_status()
+            vid_data = vid.content
     except Exception as e:
-        err_text = r.text[:200] if 'r' in locals() else 'No response'
+        err_text = vid.text[:200] if 'vid' in locals() else 'No response'
         send_tg(f"❌ Video API error: {e}\nHF Response: {err_text}")
         return False
 
     with open(VIDEO_FILE, "wb") as f:
-        f.write(r.content)
+        f.write(vid_data)
 
-    send_tg("✅ Video ready")
+    print(f"Video saved as {VIDEO_FILE}")
     return True
 
+def main_loop():
+    send_tg("🤖 Bot started on Render")
+    while True:
+        try:
+            story, video_prompt = generate_story()
+            if not story:
+                time.sleep(300) # wait 5 min and retry
+                continue
+
+            send_tg(f"📖 Story:\n{story}")
+            success = generate_video(video_prompt)
+
+            if success and os.path.exists(VIDEO_FILE):
+                send_tg("📤 Sending video...")
+                send_video_tg(VIDEO_FILE, caption=story[:200])
+            else:
+                send_tg("❌ Video generation failed")
+
+            # Wait 1 hour before next story
+            time.sleep(3600)
+
+        except Exception as e:
+            send_tg(f"❌ Unexpected error: {e}")
+            time.sleep(300)
+
 if __name__ == "__main__":
-    send_tg("Bot started on Render")
-    story, prompt = generate_story()
-    if story and prompt:
-        generate_video(prompt)
+    print("Starting bot...")
+    main_loop()
